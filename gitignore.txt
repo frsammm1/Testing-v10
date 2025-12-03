@@ -1,0 +1,79 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# Downloads
+downloads/
+*.mp4
+*.mkv
+*.webm
+*.ts
+*.avi
+*.mov
+*.flv
+*.wmv
+
+# Documents
+*.pdf
+*.txt
+*.html
+*.doc
+*.docx
+*.zip
+*.rar
+
+# Images
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.webp
+*.svg
+
+# Session files
+*.session
+*.session-journal
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp files
+temp_*
+thumb_*
+*_part*
+failed_link_*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Build
+build/
+dist/
+*.egg-info/
+
+# Docker
+docker-compose.override.yml
