@@ -3,13 +3,14 @@ import asyncio
 import logging
 import time
 from typing import Optional, List
+from pathlib import Path
 from pyrogram import Client
 from pyrogram.types import Message
 from pyrogram.errors import FloodWait, RPCError
-from utils import format_size, format_time, create_progress_bar, split_large_file
+from utils import format_size, format_time, create_progress_bar
 from config import (
-    UPLOAD_CHUNK_SIZE, TELEGRAM_FILE_LIMIT, 
-    SAFE_SPLIT_SIZE, UPLOAD_PROGRESS_INTERVAL
+    UPLOAD_CHUNK_SIZE, SAFE_SPLIT_SIZE, 
+    UPLOAD_PROGRESS_INTERVAL, DOWNLOAD_DIR
 )
 
 logger = logging.getLogger(__name__)
@@ -72,6 +73,32 @@ class UploadProgressTracker:
             logger.debug(f"Progress update error: {e}")
 
 
+def detect_multi_part_files(base_path: str) -> List[str]:
+    """
+    Detect if file was split into multiple parts
+    Returns list of all part files in order
+    """
+    base_file = Path(base_path)
+    
+    # Check if this is already a part file
+    if '_part' in base_file.name:
+        # Extract base name
+        parts = base_file.name.split('_part')
+        base_name = parts[0]
+        ext = base_file.suffix
+        
+        # Find all parts
+        pattern = f"{base_name}_part*{ext}"
+        all_parts = sorted(DOWNLOAD_DIR.glob(pattern))
+        
+        if len(all_parts) > 1:
+            logger.info(f"🔍 Detected {len(all_parts)} parts for multi-part file")
+            return [str(p) for p in all_parts]
+    
+    # Single file
+    return [base_path] if os.path.exists(base_path) else []
+
+
 async def upload_video(
     client: Client,
     chat_id: int,
@@ -84,51 +111,66 @@ async def upload_video(
     height: int = 720
 ) -> bool:
     """
-    Upload video with SMART 2GB+ handling
-    Auto-splits large files perfectly
+    SMART video upload with auto multi-part detection
     """
     try:
-        file_size = os.path.getsize(video_path)
-        file_size_mb = file_size / (1024 * 1024)
+        # Detect if this is part of a multi-part file
+        all_parts = detect_multi_part_files(video_path)
         
-        logger.info(f"📹 Video size: {file_size_mb:.2f}MB, Limit: {TELEGRAM_FILE_LIMIT}MB")
-        
-        # Check if splitting needed
-        if file_size_mb > SAFE_SPLIT_SIZE:
-            logger.info(f"🔪 Large file detected! Splitting...")
-            await progress_msg.edit_text(
-                f"📦 **Large File Detected!**\n\n"
-                f"Size: {file_size_mb:.1f}MB\n"
-                f"Telegram Limit: {TELEGRAM_FILE_LIMIT}MB\n\n"
-                f"🔪 Splitting into parts...\n"
-                f"Please wait..."
+        if len(all_parts) == 1:
+            # Single file upload
+            file_size = os.path.getsize(video_path)
+            file_size_mb = file_size / (1024 * 1024)
+            
+            logger.info(f"📹 Single file upload: {file_size_mb:.2f}MB")
+            
+            tracker = UploadProgressTracker(progress_msg, os.path.basename(video_path))
+            
+            await client.send_video(
+                chat_id=chat_id,
+                video=video_path,
+                caption=caption,
+                supports_streaming=True,
+                duration=duration,
+                width=width,
+                height=height,
+                thumb=thumb_path,
+                progress=tracker.progress_callback
             )
             
-            # Split the file
-            parts = await split_large_file(video_path, SAFE_SPLIT_SIZE)
+            logger.info(f"✅ Video uploaded successfully")
+            return True
+        
+        # Multi-part upload
+        logger.info(f"📦 Multi-part upload: {len(all_parts)} parts detected")
+        
+        await progress_msg.edit_text(
+            f"📦 **MULTI-PART UPLOAD**\n\n"
+            f"Detected {len(all_parts)} parts\n"
+            f"Uploading each part...\n\n"
+            f"⏳ Please wait..."
+        )
+        
+        # Upload each part
+        for i, part_path in enumerate(all_parts, 1):
+            if not os.path.exists(part_path):
+                logger.warning(f"⚠️ Part {i} not found: {part_path}")
+                continue
             
-            if not parts or len(parts) == 0:
-                logger.error("❌ File splitting failed!")
-                await progress_msg.edit_text(
-                    "❌ **Splitting Failed!**\n\n"
-                    "Could not split the large file.\n"
-                    "This might be due to disk space issues."
-                )
-                return False
+            part_size = os.path.getsize(part_path) / (1024 * 1024)
+            part_caption = f"{caption}\n\n📦 **Part {i}/{len(all_parts)}** ({part_size:.1f}MB)"
             
-            logger.info(f"✅ File split into {len(parts)} parts")
+            tracker = UploadProgressTracker(
+                progress_msg, 
+                os.path.basename(part_path), 
+                i, 
+                len(all_parts)
+            )
             
-            # Upload each part
-            for i, part_path in enumerate(parts, 1):
-                if not os.path.exists(part_path):
-                    logger.error(f"Part {i} not found: {part_path}")
-                    continue
-                
-                part_size = os.path.getsize(part_path) / (1024 * 1024)
-                part_caption = f"{caption}\n\n📦 **Part {i}/{len(parts)}** ({part_size:.1f}MB)"
-                
-                tracker = UploadProgressTracker(progress_msg, os.path.basename(part_path), i, len(parts))
-                
+            retry_count = 0
+            max_retries = 3
+            
+            while retry_count < max_retries:
                 try:
                     await client.send_video(
                         chat_id=chat_id,
@@ -142,59 +184,36 @@ async def upload_video(
                         progress=tracker.progress_callback
                     )
                     
-                    logger.info(f"✅ Part {i}/{len(parts)} uploaded successfully!")
+                    logger.info(f"✅ Part {i}/{len(all_parts)} uploaded successfully")
+                    break
                     
                 except FloodWait as e:
-                    logger.warning(f"FloodWait {e.value}s, waiting...")
+                    logger.warning(f"⏳ FloodWait {e.value}s for part {i}")
                     await asyncio.sleep(e.value)
-                    # Retry
-                    await client.send_video(
-                        chat_id=chat_id,
-                        video=part_path,
-                        caption=part_caption,
-                        supports_streaming=True,
-                        progress=tracker.progress_callback
-                    )
-                
+                    retry_count += 1
+                    
                 except Exception as e:
-                    logger.error(f"❌ Part {i} upload failed: {e}")
-                    return False
-                
-                finally:
-                    # Cleanup part file
-                    try:
-                        if os.path.exists(part_path):
-                            os.remove(part_path)
-                            logger.info(f"🗑️ Cleaned up part {i}")
-                    except Exception as e:
-                        logger.debug(f"Cleanup error: {e}")
+                    logger.error(f"❌ Part {i} upload error: {e}")
+                    retry_count += 1
+                    if retry_count < max_retries:
+                        await asyncio.sleep(5)
+                    else:
+                        raise
             
-            # All parts uploaded successfully
-            await progress_msg.edit_text(
-                f"✅ **All Parts Uploaded!**\n\n"
-                f"📦 Total Parts: {len(parts)}\n"
-                f"💾 Total Size: {file_size_mb:.1f}MB\n\n"
-                f"🎉 Upload Complete!"
-            )
-            return True
+            # Small delay between parts
+            await asyncio.sleep(1)
         
-        # Normal upload for files under limit
-        logger.info(f"📤 Uploading video normally (under limit)")
-        tracker = UploadProgressTracker(progress_msg, os.path.basename(video_path))
+        # All parts uploaded
+        total_size = sum(os.path.getsize(p) for p in all_parts if os.path.exists(p))
+        total_size_mb = total_size / (1024 * 1024)
         
-        await client.send_video(
-            chat_id=chat_id,
-            video=video_path,
-            caption=caption,
-            supports_streaming=True,
-            duration=duration,
-            width=width,
-            height=height,
-            thumb=thumb_path,
-            progress=tracker.progress_callback
+        await progress_msg.edit_text(
+            f"✅ **ALL PARTS UPLOADED!**\n\n"
+            f"📦 Total Parts: {len(all_parts)}\n"
+            f"💾 Total Size: {total_size_mb:.1f}MB\n\n"
+            f"🎉 Upload Complete!"
         )
         
-        logger.info(f"✅ Video uploaded successfully: {video_path}")
         return True
         
     except FloodWait as e:
@@ -205,6 +224,17 @@ async def upload_video(
     except Exception as e:
         logger.error(f"❌ Video upload error: {e}", exc_info=True)
         return False
+    
+    finally:
+        # Cleanup parts
+        try:
+            all_parts = detect_multi_part_files(video_path)
+            for part in all_parts:
+                if os.path.exists(part):
+                    os.remove(part)
+                    logger.info(f"🗑️ Cleaned up: {os.path.basename(part)}")
+        except Exception as e:
+            logger.debug(f"Cleanup error: {e}")
 
 
 async def upload_photo(
@@ -245,39 +275,45 @@ async def upload_document(
     progress_msg: Message
 ) -> bool:
     """
-    Upload document with auto-splitting for large files
+    Smart document upload with multi-part detection
     """
     try:
-        file_size = os.path.getsize(document_path)
-        file_size_mb = file_size / (1024 * 1024)
+        # Detect multi-part
+        all_parts = detect_multi_part_files(document_path)
         
-        logger.info(f"📄 Document size: {file_size_mb:.2f}MB")
-        
-        # Check if splitting needed
-        if file_size_mb > SAFE_SPLIT_SIZE:
-            logger.info(f"🔪 Large document! Splitting...")
-            await progress_msg.edit_text(
-                f"📦 **Large Document Detected!**\n\n"
-                f"Size: {file_size_mb:.1f}MB\n"
-                f"Splitting into parts..."
+        if len(all_parts) == 1:
+            # Single file
+            tracker = UploadProgressTracker(progress_msg, os.path.basename(document_path))
+            
+            await client.send_document(
+                chat_id=chat_id,
+                document=document_path,
+                caption=caption,
+                progress=tracker.progress_callback
             )
             
-            parts = await split_large_file(document_path, SAFE_SPLIT_SIZE)
+            logger.info(f"✅ Document uploaded: {document_path}")
+            return True
+        
+        # Multi-part
+        logger.info(f"📦 Multi-part document: {len(all_parts)} parts")
+        
+        for i, part_path in enumerate(all_parts, 1):
+            if not os.path.exists(part_path):
+                continue
             
-            if not parts:
-                logger.error("Document splitting failed")
-                return False
+            part_size = os.path.getsize(part_path) / (1024 * 1024)
+            part_caption = f"{caption}\n\n📦 Part {i}/{len(all_parts)} ({part_size:.1f}MB)"
             
-            # Upload each part
-            for i, part_path in enumerate(parts, 1):
-                if not os.path.exists(part_path):
-                    continue
-                
-                part_size = os.path.getsize(part_path) / (1024 * 1024)
-                part_caption = f"{caption}\n\n📦 Part {i}/{len(parts)} ({part_size:.1f}MB)"
-                
-                tracker = UploadProgressTracker(progress_msg, os.path.basename(part_path), i, len(parts))
-                
+            tracker = UploadProgressTracker(
+                progress_msg,
+                os.path.basename(part_path),
+                i,
+                len(all_parts)
+            )
+            
+            retry_count = 0
+            while retry_count < 3:
                 try:
                     await client.send_document(
                         chat_id=chat_id,
@@ -285,43 +321,23 @@ async def upload_document(
                         caption=part_caption,
                         progress=tracker.progress_callback
                     )
+                    logger.info(f"✅ Document part {i}/{len(all_parts)} uploaded")
+                    break
                     
-                    logger.info(f"✅ Document part {i}/{len(parts)} uploaded")
-                
                 except FloodWait as e:
                     await asyncio.sleep(e.value)
-                    # Retry
-                    await client.send_document(
-                        chat_id=chat_id,
-                        document=part_path,
-                        caption=part_caption,
-                        progress=tracker.progress_callback
-                    )
-                
+                    retry_count += 1
+                    
                 except Exception as e:
-                    logger.error(f"Part {i} upload failed: {e}")
-                    return False
-                
-                finally:
-                    try:
-                        if os.path.exists(part_path):
-                            os.remove(part_path)
-                    except:
-                        pass
+                    logger.error(f"Part {i} error: {e}")
+                    retry_count += 1
+                    if retry_count < 3:
+                        await asyncio.sleep(5)
+                    else:
+                        raise
             
-            return True
+            await asyncio.sleep(1)
         
-        # Normal upload
-        tracker = UploadProgressTracker(progress_msg, os.path.basename(document_path))
-        
-        await client.send_document(
-            chat_id=chat_id,
-            document=document_path,
-            caption=caption,
-            progress=tracker.progress_callback
-        )
-        
-        logger.info(f"✅ Document uploaded: {document_path}")
         return True
         
     except FloodWait as e:
@@ -331,6 +347,16 @@ async def upload_document(
     except Exception as e:
         logger.error(f"❌ Document upload error: {e}")
         return False
+    
+    finally:
+        # Cleanup
+        try:
+            all_parts = detect_multi_part_files(document_path)
+            for part in all_parts:
+                if os.path.exists(part):
+                    os.remove(part)
+        except:
+            pass
 
 
 async def send_failed_link(
@@ -344,10 +370,9 @@ async def send_failed_link(
 ) -> bool:
     """
     UNIVERSAL failed link handler
-    Works for ALL file types - videos, images, documents
+    Works for ALL file types
     """
     try:
-        # Emoji based on file type
         type_emoji = {
             'video': '🎬',
             'image': '🖼️',
@@ -396,8 +421,7 @@ async def send_to_destination(
     height: int = 720
 ) -> bool:
     """
-    Send file to destination channel/group
-    Supports videos, photos, documents
+    Send file to destination with smart multi-part handling
     """
     try:
         if file_type == 'video':
